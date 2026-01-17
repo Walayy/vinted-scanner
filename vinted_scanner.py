@@ -86,18 +86,18 @@ def load_analyzed_item():
             for line in f:
                 if line:
                     list_analyzed_items.append(line.rstrip())
-    except IOError as e:
-        logging.error(e, exc_info=True)
-        sys.exit()
+    except FileNotFoundError:
+        logging.info("vinted_items.txt not found, starting fresh.")
+    except Exception as e:
+        logging.error("Error loading analyzed items", exc_info=True)
 
 # Save a new analyzed item to prevent repeated alerts
 def save_analyzed_item(hash):
     try:
         with open("vinted_items.txt", "a") as f:
             f.write(str(hash) + "\n")
-    except IOError as e:
-        logging.error(e, exc_info=True)
-        sys.exit()
+    except Exception as e:
+        logging.error("Error saving analyzed item", exc_info=True)
 
 async def send_discord_message(item_title, item_price, item_url, item_image, discord_channel_id: int):
     message = (
@@ -108,7 +108,7 @@ async def send_discord_message(item_title, item_price, item_url, item_image, dis
         f"🖼️ **Image :** {item_image}\n"
     )
     try:
-        await send_message(message, discord_channel_id)
+        await send_message(message, int(discord_channel_id))
     except requests.exceptions.RequestException as e:
         logging.error(f"Error sending Telegram message: {e}")
 
@@ -142,9 +142,6 @@ def _title_matches_filters(title: str, filters) -> bool:
     return True
 
 async def scan_vinted_once():
-    # Load the list of previously analyzed items
-    load_analyzed_item()
-
     # Initialize session and obtain session cookies from Vinted
     session = requests.Session()
     session.post(Config.vinted_url, headers=headers, timeout=timeoutconnection)
@@ -179,6 +176,7 @@ async def scan_vinted_once():
                     save_analyzed_item(item_id)
 
 async def main():
+    load_analyzed_item()
     discord_task = asyncio.create_task(start_discord())
     try:
         while True:
