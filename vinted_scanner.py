@@ -1,16 +1,54 @@
 #!/usr/bin/env python3
-import sys
-import time
+import asyncio
 import json
-import Config
-import smtplib
 import logging
-import requests
-import email.utils
-from datetime import datetime
-from email.message import EmailMessage
+import sys
 from logging.handlers import RotatingFileHandler
 
+import discord
+import requests
+import unicodedata
+
+import Config
+
+DISCORD_TOKEN = Config.DISCORD_TOKEN
+
+intents = discord.Intents.default()
+client = discord.Client(intents=intents)
+
+_discord_ready = asyncio.Event()
+
+@client.event
+async def on_ready():
+    logging.info(f"[DISCORD] Connecté en tant que {client.user}")
+    _discord_ready.set()
+
+async def start_discord():
+    try:
+        await client.start(DISCORD_TOKEN)
+    except Exception as e:
+        logging.error(f"[DISCORD] Impossible de démarrer: {e}", exc_info=True)
+        # on libère l'attente pour éviter un deadlock
+        _discord_ready.set()
+
+async def send_message(message: str, discord_channel_id: int):
+    # attend au max 20s que discord soit prêt (ou qu'il ait échoué)
+    await asyncio.wait_for(_discord_ready.wait(), timeout=20)
+
+    # si le bot n'est pas connecté, on évite de planter
+    if not client.is_ready():
+        logging.error("[DISCORD] Bot non prêt / non connecté, message non envoyé.")
+        return
+
+    channel = client.get_channel(discord_channel_id)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(discord_channel_id)
+        except Exception as e:
+            logging.error(f"[DISCORD] Channel introuvable: {e}", exc_info=True)
+            return
+
+    await channel.send(message)
 
 # Configure a rotating file handler to manage log files
 handler = RotatingFileHandler("vinted_scanner.log", maxBytes=5000000, backupCount=5)
@@ -61,93 +99,49 @@ def save_analyzed_item(hash):
         logging.error(e, exc_info=True)
         sys.exit()
 
-# Send notification e-mail when a new item is found
-def send_email(item_title, item_price, item_url, item_image):
+async def send_discord_message(item_title, item_price, item_url, item_image, discord_channel_id: int):
+    message = (
+        "🆕 **Nouvel article Vinted trouvé !**\n\n"
+        f"👕 **Produit :** {item_title}\n"
+        f"🏷️ **Prix :** {item_price}\n"
+        f"🔗 **Lien :** {item_url}\n"
+        f"🖼️ **Image :** {item_image}\n"
+    )
     try:
-        # Create the e-mail message
-        msg = EmailMessage()
-        msg["To"] = Config.smtp_toaddrs
-        msg["From"] = email.utils.formataddr(("Vinted Scanner", Config.smtp_username))
-        msg["Subject"] = "Vinted Scanner - New Item"
-        msg["Date"] = email.utils.formatdate(localtime=True)
-        msg["Message-ID"] = email.utils.make_msgid()
-
-        # Format message content
-        body = f"{item_title}\n{item_price}\n🔗 {item_url}\n📷 {item_image}"
-
-        msg.set_content(body)
-        
-        # Securely opening the SMTP connection
-        with smtplib.SMTP(Config.smtp_server, 587) as smtpserver:
-            smtpserver.ehlo()
-            smtpserver.starttls()
-            smtpserver.ehlo()
-
-            # Authentication
-            smtpserver.login(Config.smtp_username, Config.smtp_psw)
-            
-            # Sending the message
-            smtpserver.send_message(msg)
-            logging.info("E-mail sent")
-    
-    except smtplib.SMTPException as e:
-        logging.error(f"SMTP error sending email: {e}", exc_info=True)
-    except Exception as e:
-        logging.error(f"Error sending email: {e}", exc_info=True)
-
-
-# Send a Slack message when a new item is found
-def send_slack_message(item_title, item_price, item_url, item_image):
-    webhook_url = Config.slack_webhook_url 
-
-    # Format message content
-    message = f"*{item_title}*\n🏷️ {item_price}\n🔗 {item_url}\n📷 {item_image}"
-    slack_data = {"text": message}
-
-    try:
-        response = requests.post(
-            webhook_url, 
-            data=json.dumps(slack_data),
-            headers={"Content-Type": "application/json"},
-            timeout=timeoutconnection
-        )
-
-        if response.status_code != 200:
-            logging.error(f"Slack notification failed: {response.status_code}, {response.text}")
-        else:
-            logging.info("Slack notification sent")
-
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Error sending Slack message: {e}")
-
-# Send a Telegram message when a new item is found
-def send_telegram_message(item_title, item_price, item_url, item_image):
-
-    # Format message content
-    message = f"<b>{item_title}*</b>\n🏷️ {item_price}\n🔗 {item_url}\n📷 {item_image}"
-
-    try:
-        url = f"https://api.telegram.org/bot{Config.telegram_bot_token}/sendMessage"
-
-        params = {
-            "chat_id": Config.telegram_chat_id,
-            "text": message,
-            "parse_mode": "HTML",
-            "link_preview_options":  json.dumps({
-                "is_disabled": True
-            })
-        }
-
-        response = requests.post(url, params=params, headers=headers)
-        if response.status_code != 200:
-            logging.error(f"Telegram notification failed. Status code: {response.status_code}, Response: {response.text}")
-        else:
-            logging.info("Telegram notification sent")
-
+        await send_message(message, discord_channel_id)
     except requests.exceptions.RequestException as e:
         logging.error(f"Error sending Telegram message: {e}")
 
-def main():
+def _norm(s: str) -> str:
+    # lower + enlève les accents (dončić -> doncic)
+    s = s.lower()
+    s = unicodedata.normalize("NFKD", s)
+    return "".join(c for c in s if not unicodedata.combining(c))
+
+
+def _title_matches_filters(title: str, filters) -> bool:
+    """
+    filters = ["luka", ["doncic","dončić"], ["rc","rookie"]]
+    => chaque élément du top-level doit matcher:
+       - str : doit être contenu
+       - list : au moins un élément contenu
+    """
+    t = _norm(title)
+
+    for f in filters:
+        if isinstance(f, str):
+            if _norm(f) not in t:
+                return False
+        elif isinstance(f, (list, tuple, set)):
+            if not any(_norm(opt) in t for opt in f):
+                return False
+        else:
+            # type inattendu => on considère que ça ne matche pas
+            return False
+
+    return True
+
+async def scan_vinted_once():
     # Load the list of previously analyzed items
     load_analyzed_item()
 
@@ -168,6 +162,9 @@ def main():
             for item in data["items"]:
                 item_id = str(item["id"])
                 item_title = item["title"]
+                title_filters = params.get("title_filters", [])
+                if title_filters and not _title_matches_filters(item_title, title_filters):
+                    continue
                 item_url = item["url"]
                 item_price = f'{item["price"]["amount"]} {item["price"]["currency_code"]}'
                 item_image = item["photo"]["full_size_url"]
@@ -175,21 +172,25 @@ def main():
                 # Check if the item has already been analyzed to prevent duplicates
                 if item_id not in list_analyzed_items:
 
-                    # Send e-mail notifications if configured
-                    if Config.smtp_username and Config.smtp_server:
-                        send_email(item_title, item_price,item_url, item_image)
-
-                    # Send Slack notifications if configured
-                    if Config.slack_webhook_url:
-                        send_slack_message(item_title, item_price, item_url, item_image)
-
-                    # Send Telegram notifications if configured
-                    if Config.telegram_bot_token and Config.telegram_chat_id:
-                        send_telegram_message(item_title, item_price, item_url, item_image)
+                    await send_discord_message(item_title, item_price, item_url, item_image, params.get("discord_channel_id"))
 
                     # Mark item as analyzed and save it
                     list_analyzed_items.append(item_id)
                     save_analyzed_item(item_id)
 
+async def main():
+    discord_task = asyncio.create_task(start_discord())
+    try:
+        await scan_vinted_once()
+    finally:
+        if client.is_ready() or client.is_closed() is False:
+            await client.close()
+        if not discord_task.done():
+            discord_task.cancel()
+            try:
+                await discord_task
+            except asyncio.CancelledError:
+                pass
+
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
