@@ -181,7 +181,9 @@ async def scan_vinted_once():
 async def main():
     discord_task = asyncio.create_task(start_discord())
     try:
-        await scan_vinted_once()
+        while True:
+            await scan_vinted_once()
+            await asyncio.sleep(600)
     finally:
         if client.is_ready() or client.is_closed() is False:
             await client.close()
