@@ -31,7 +31,7 @@ queries = [
 	{
 		'page': '1',
 		'per_page': '96',
-		'search_text': 'brice sensabaugh',
+		'search_text': 'sensabaugh',
 		'title_filters': [
 			'brice',
 			'sensabaugh'
@@ -83,7 +83,7 @@ queries = [
 	{
 		'page': '1',
 		'per_page': '96',
-		'search_text': 'luka doncic',
+		'search_text': 'doncic',
 		'title_filters': [
 			'luka',
 			['doncic', 'dončić', 'doncić'],

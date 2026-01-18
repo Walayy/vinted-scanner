@@ -1,54 +1,152 @@
 #!/usr/bin/env python3
+import ast
 import asyncio
-import json
 import logging
-import sys
+import os
 from logging.handlers import RotatingFileHandler
+from typing import cast
 
 import discord
 import requests
 import unicodedata
+from discord.ext import commands
 
 import Config
 
-DISCORD_TOKEN = Config.DISCORD_TOKEN
+def _parse_filters(raw: str):
+    try:
+        return ast.literal_eval(raw)
+    except Exception:
+        return []
 
 intents = discord.Intents.default()
-client = discord.Client(intents=intents)
+intents.message_content = True  # IMPORTANT
 
-_discord_ready = asyncio.Event()
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-@client.event
+_scan_task = None
+
+@bot.event
 async def on_ready():
-    logging.info(f"[DISCORD] Connecté en tant que {client.user}")
-    _discord_ready.set()
+    global _scan_task
+    logging.info(f"[DISCORD] Connecté en tant que {bot.user}")
 
-async def start_discord():
-    try:
-        await client.start(DISCORD_TOKEN)
-    except Exception as e:
-        logging.error(f"[DISCORD] Impossible de démarrer: {e}", exc_info=True)
-        # on libère l'attente pour éviter un deadlock
-        _discord_ready.set()
+    if _scan_task is None:  # évite double lancement si reconnexion
+        load_analyzed_item()
+        _scan_task = asyncio.create_task(auto_scan_loop())
 
-async def send_message(message: str, discord_channel_id: int):
-    # attend au max 20s que discord soit prêt (ou qu'il ait échoué)
-    await asyncio.wait_for(_discord_ready.wait(), timeout=20)
+@bot.command()
+@commands.has_permissions(manage_messages=True)
+async def purgeall(ctx):
+    """
+    !purgeall -> supprime tous les messages du salon (moins de 14 jours)
+    """
 
-    # si le bot n'est pas connecté, on évite de planter
-    if not client.is_ready():
-        logging.error("[DISCORD] Bot non prêt / non connecté, message non envoyé.")
+    # supprime aussi la commande
+    await ctx.message.delete()
+
+    deleted = await ctx.channel.purge(limit=None)
+
+    msg = await ctx.send(f"🧹 Salon nettoyé ({len(deleted)} messages supprimés).", delete_after=3)
+
+@bot.command()
+async def scanfull(ctx, *, arg: str):
+    """
+    !scanfull <search text> | [filters]
+    """
+
+    ALLOWED_CHANNEL = int(os.getenv("SCAN_COMMAND_CHANNEL_ID"))
+
+    if ctx.channel.id != ALLOWED_CHANNEL:
+        await ctx.send("❌ Cette commande est disponible uniquement dans #scan-manuel.")
         return
 
-    channel = client.get_channel(discord_channel_id)
+    if "|" in arg:
+        search_text, raw_filters = arg.split("|", 1)
+        search_text = search_text.strip()
+        raw_filters = raw_filters.strip()
+        title_filters = _parse_filters(raw_filters)
+    else:
+        search_text = arg.strip()
+        title_filters = []
+
+    guild = ctx.guild
+
+    # supprime le message commande !scanfull
+    try:
+        await ctx.message.delete()
+    except discord.Forbidden:
+        pass
+
+    CATEGORY_ID = int(os.getenv("SCAN_CATEGORY_ID"))
+    category = discord.utils.get(guild.categories, id=CATEGORY_ID)
+
+    safe_name = search_text.replace(" ", "-").lower()[:90]
+    temp_channel = await guild.create_text_channel(
+        name=safe_name,
+        category=category
+    )
+
+    progress_msg = await ctx.send(
+        f"🔍 **Scan en cours...**\n"
+        f"Recherche : `{search_text}`\n"
+        f"Filtres : `{title_filters or 'Aucun'}`\n"
+        f"Pages : en cours...\n"
+        f"Cartes trouvées : 0"
+    )
+
+    params = {
+        "page": "1",
+        "per_page": "96",
+        "search_text": search_text,
+        "order": "newest_first",
+        "max_page": "80",
+        "title_filters": title_filters,
+    }
+
+    found_count_box = {"n": 0}
+
+    params["_found_box"] = found_count_box
+
+    async def progress_cb(done, total):
+        await progress_msg.edit(
+            content=
+            f"🔍 **Scan en cours...**\n"
+            f"Recherche : `{search_text}`\n"
+            f"Filtres : `{title_filters or 'Aucun'}`\n"
+            f"Page : {done} / {total}\n"
+            f"Cartes trouvées : {found_count_box['n']}"
+        )
+
+    found_count = await scan_vinted(
+        params,
+        full_scan=True,
+        send_channel_id=temp_channel.id,
+        progress_cb=progress_cb
+    )
+
+    # -------- done --------
+    await progress_msg.edit(
+        content=
+        f"✅ **Scan terminé !**\n"
+        f"Recherche : `{search_text}`\n"
+        f"Cartes trouvées : {found_count}\n"
+        f"Résultats : {temp_channel.mention}"
+    )
+
+async def send_embed(embed, view, discord_channel_id: int):
+    # bot.wait_until_ready() = équivalent propre
+    await bot.wait_until_ready()
+
+    channel = bot.get_channel(int(discord_channel_id))
     if channel is None:
         try:
-            channel = await client.fetch_channel(discord_channel_id)
-        except Exception as e:
-            logging.error(f"[DISCORD] Channel introuvable: {e}", exc_info=True)
+            channel = await bot.fetch_channel(int(discord_channel_id))
+        except Exception:
+            logging.error("[DISCORD] Channel introuvable", exc_info=True)
             return
 
-    await channel.send(message)
+    await channel.send(embed=embed, view=view)
 
 # Configure a rotating file handler to manage log files
 handler = RotatingFileHandler("vinted_scanner.log", maxBytes=5000000, backupCount=5)
@@ -99,18 +197,38 @@ def save_analyzed_item(hash):
     except Exception as e:
         logging.error("Error saving analyzed item", exc_info=True)
 
-async def send_discord_message(item_title, item_price, item_url, item_image, discord_channel_id: int):
-    message = (
-        "🆕 **Nouvel article Vinted trouvé !**\n\n"
-        f"👕 **Produit :** {item_title}\n"
-        f"🏷️ **Prix :** {item_price}\n"
-        f"🔗 **Lien :** {item_url}\n"
-        f"🖼️ **Image :** {item_image}\n"
+async def send_discord_message(username, item_title, item_price, item_url, item_image, discord_channel_id: int):
+    embed = discord.Embed(
+        title = "🆕 Nouvelle(s) carte(s) Vinted",
+        description = f"**{item_title}**",
+        color = 0x2ECC71,
+        url = item_url
     )
+
+    embed.set_image(url = item_image)
+
+    embed.set_author(
+        name = f"👤 {username}",
+    )
+
+    embed.add_field(name = "💰 Prix", value = item_price, inline = True)
+    embed.add_field(name = "🔗 Annonce", value = f"[Ouvrir sur Vinted]({item_url})", inline = True)
+
+    embed.set_footer(text = "Voggt Scanner • Vinted")
+
+    view = discord.ui.View()
+    view.add_item(
+        discord.ui.Button(
+            label = "📲 Ouvrir dans Vinted",
+            style = cast(discord.ButtonStyle, discord.ButtonStyle.link),
+            url = item_url
+        )
+    )
+
     try:
-        await send_message(message, int(discord_channel_id))
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Error sending Telegram message: {e}")
+        await send_embed(embed, view, discord_channel_id)
+    except Exception as e:
+        logging.error("Error sending Discord embed", exc_info = True)
 
 def _norm(s: str) -> str:
     # lower + enlève les accents (dončić -> doncic)
@@ -141,56 +259,112 @@ def _title_matches_filters(title: str, filters) -> bool:
 
     return True
 
-async def scan_vinted_once():
-    # Initialize session and obtain session cookies from Vinted
+async def scan_vinted(params, *, full_scan=False, send_channel_id=None, progress_cb=None):
+
     session = requests.Session()
     session.post(Config.vinted_url, headers=headers, timeout=timeoutconnection)
     cookies = session.cookies.get_dict()
-    
-    # Loop through each search query defined in Config.py
-    for params in Config.queries:
-        # Request items from the Vinted API based on the search parameters
-        response = requests.get(f"{Config.vinted_url}/api/v2/catalog/items", params=params, cookies=cookies, headers=headers)
 
-        data = response.json()
+    api_params = {
+        "page": "1",
+        "per_page": params.get("per_page", "96"),
+        "search_text": params.get("search_text", "*"),
+        "catalog_ids": params.get("catalog_ids", ""),
+        "brand_ids": params.get("brand_ids", ""),
+        "order": params.get("order", "newest_first"),
+    }
 
-        if data:
-            # Process each item returned in the response
-            for item in data["items"]:
-                item_id = str(item["id"])
-                item_title = item["title"]
-                title_filters = params.get("title_filters", [])
-                if title_filters and not _title_matches_filters(item_title, title_filters):
-                    continue
-                item_url = item["url"]
-                item_price = f'{item["price"]["amount"]} {item["price"]["currency_code"]}'
-                item_image = item["photo"]["full_size_url"]
+    # ---- première requête ----
+    r = requests.get(
+        f"{Config.vinted_url}/api/v2/catalog/items",
+        params=api_params,
+        cookies=cookies,
+        headers=headers,
+        timeout=timeoutconnection
+    )
+    data = r.json()
 
-                # Check if the item has already been analyzed to prevent duplicates
-                if item_id not in list_analyzed_items:
+    pagination = data.get("pagination", {})
+    total_pages = int(pagination.get("total_pages", 1))
 
-                    await send_discord_message(item_title, item_price, item_url, item_image, params.get("discord_channel_id"))
+    logging.info(f"[SCAN] pages {total_pages} -> 1 | {params.get('search_text')}")
 
-                    # Mark item as analyzed and save it
+    # ---- boucle pages ----
+    found = 0
+    if full_scan:
+        pages = range(1, total_pages + 1)
+    else:
+        pages = range(1, min(total_pages, 1) + 1)
+
+    for idx, page in enumerate(pages, start = 1):
+        if progress_cb:
+            await progress_cb(idx, len(pages))
+        api_params["page"] = str(page)
+
+        r = session.get(
+            f"{Config.vinted_url}/api/v2/catalog/items",
+            params=api_params,
+            cookies=cookies,
+            headers=headers,
+            timeout=timeoutconnection
+        )
+
+        data = r.json()
+        items = data.get("items", [])
+
+        for item in items:
+            item_id = str(item["id"])
+            item_title = item["title"]
+
+            title_filters = params.get("title_filters", [])
+            if title_filters and not _title_matches_filters(item_title, title_filters):
+                continue
+
+            user = item.get("user") or {}
+            username = user.get("login", "N/A")
+
+            item_url = item["url"]
+            item_price = f'{item["price"]["amount"]} {item["price"]["currency_code"]}'
+            item_image = item["photo"]["full_size_url"]
+
+            if item_id not in list_analyzed_items or full_scan:
+                await send_discord_message(
+                    username,
+                    item_title,
+                    item_price,
+                    item_url,
+                    item_image,
+                    send_channel_id or params.get("discord_channel_id")
+                )
+
+                found += 1
+                box = params.get("_found_box")
+                if box is not None:
+                    box["n"] = found
+
+                if progress_cb and found % 5 == 0:
+                    await progress_cb(idx, len(pages))
+
+                if not full_scan:
                     list_analyzed_items.append(item_id)
                     save_analyzed_item(item_id)
 
-async def main():
-    load_analyzed_item()
-    discord_task = asyncio.create_task(start_discord())
-    try:
-        while True:
+        if progress_cb:
+            await progress_cb(idx, len(pages))
+        await asyncio.sleep(0.4)
+    return found
+
+async def scan_vinted_once():
+    for params in Config.queries:
+        await scan_vinted(params, full_scan=False)
+
+async def auto_scan_loop():
+    while True:
+        try:
             await scan_vinted_once()
-            await asyncio.sleep(600)
-    finally:
-        if client.is_ready() or client.is_closed() is False:
-            await client.close()
-        if not discord_task.done():
-            discord_task.cancel()
-            try:
-                await discord_task
-            except asyncio.CancelledError:
-                pass
+        except Exception:
+            logging.error("auto_scan_loop crashed", exc_info=True)
+        await asyncio.sleep(600)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    bot.run(Config.DISCORD_TOKEN)
